@@ -1,0 +1,49 @@
+// =============================================================================
+// gRPC Service Definition for Model Inference
+// =============================================================================
+// This proto file defines the same inference interface that the REST API exposes.
+// Task 1 (REST vs gRPC) uses this to implement a full gRPC server and compare
+// performance characteristics.
+//
+// Compile with:
+//   python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. inference.proto
+// =============================================================================
+
+syntax = "proto3";
+
+package inference;
+
+// The inference service — mirrors the REST /inference endpoint
+service InferenceService {
+    // Unary RPC: send a prompt, get a complete response
+    rpc Generate (GenerateRequest) returns (GenerateResponse);
+
+    // Server streaming RPC: send a prompt, receive tokens as they're generated
+    rpc GenerateStream (GenerateRequest) returns (stream GenerateChunk);
+}
+
+message GenerateRequest {
+    string prompt = 1;
+    string model = 2;           // Optional: uses default if empty
+    int32 max_tokens = 3;       // Default: 1024
+    float temperature = 4;      // Default: 0.7
+    string system_prompt = 5;   // Optional
+}
+
+message GenerateResponse {
+    string text = 1;
+    string model = 2;
+    TokenUsage usage = 3;
+    float latency_ms = 4;
+}
+
+message GenerateChunk {
+    string text = 1;            // Partial token/text
+    bool is_final = 2;         // True for the last chunk
+}
+
+message TokenUsage {
+    int32 prompt_tokens = 1;
+    int32 completion_tokens = 2;
+    int32 total_tokens = 3;
+}
