@@ -33,7 +33,7 @@ export function ContentViewer({ task, subtopic, state, content }: ContentViewerP
   const navigate = useNavigate();
   const toast = useToast();
   const { markAsRead, isRead } = useTopicsStore();
-  const { setSystemPrompt } = useSettingsStore();
+  const { setTopicSystemPrompt } = useSettingsStore();
   const { createSession } = useChatStore();
 
   const sentinelRef = useRef<HTMLDivElement>(null);
@@ -60,7 +60,7 @@ export function ContentViewer({ task, subtopic, state, content }: ContentViewerP
   }, [state, read, task.id, subtopic.id, markAsRead]);
 
   const handleChatAboutThis = () => {
-    setSystemPrompt(
+    setTopicSystemPrompt(
       `You are discussing: ${task.title} — ${subtopic.label}. The user is studying production AI system design. Help with practical examples, trade-offs, and production considerations.`,
     );
     createSession();
