@@ -50,7 +50,9 @@ def test_chat_session_roundtrip() -> None:
         json={"title": "Lab 0.1 verify"},
         timeout=TIMEOUT,
     )
-    assert create.status_code in (200, 201), f"POST /chat/sessions returned {create.status_code}: {create.text}"
+    assert create.status_code in (200, 201), (
+        f"POST /chat/sessions returned {create.status_code}: {create.text}"
+    )
     session_id = create.json()["id"]
 
     # Read back

@@ -1,4 +1,4 @@
-# Lab 0.1 — Getting Started
+# Lab 0.1: Getting Started
 
 ## Problem statement
 
@@ -29,29 +29,29 @@ lab/starter/
 
 ## Steps
 
-### Task 1 — Complete the walkthrough script
+### Task 1: Complete the walkthrough script
 
 Open `lab/starter/walkthrough.sh`. Fill in each TODO with the right command. When you're done, `bash lab/starter/walkthrough.sh` should:
 
 1. Run `scripts/setup.sh` (fresh-clone setup)
 2. Remind you to edit `.env` (or just auto-set `USE_MOCK=true` for this lab)
-3. Start Postgres — pick one path based on your environment
+3. Start Postgres – pick one path based on your environment
 4. Apply migrations
 5. Start `make run` in the background
 6. Wait for `/health` to report green
 7. Curl the generate endpoint as a smoke test
 
-### Task 2 — Complete the verification script
+### Task 2: Complete the verification script
 
 Open `lab/starter/verify.py`. It has three functions with TODOs:
 
-- `test_gateway_health()` — GET `http://localhost:8000/health`, assert 200
-- `test_generate()` — POST `http://localhost:8000/api/v1/generate` with a prompt, assert 200 + non-empty response
-- `test_chat_session_roundtrip()` — POST `/api/v1/chat/sessions`, GET it back, assert the ID matches
+- `test_gateway_health()` – GET `http://localhost:8000/health`, assert 200
+- `test_generate()` – POST `http://localhost:8000/api/v1/generate` with a prompt, assert 200 + non-empty response
+- `test_chat_session_roundtrip()` – POST `/api/v1/chat/sessions`, GET it back, assert the ID matches
 
 Fill in the bodies. Run it: `python lab/starter/verify.py`. All three should print `OK`.
 
-### Task 3 — Start the frontend
+### Task 3: Start the frontend
 
 ```bash
 cd frontend
@@ -59,9 +59,9 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. Create a chat session. Send a message (in mock mode the response will be canned — that's fine). Refresh the tab. Your session should still be there (Postgres persistence from ADR-011).
+Open `http://localhost:5173`. Create a chat session. Send a message (in mock mode the response will be canned – that's fine). Refresh the tab. Your session should still be there (Postgres persistence from ADR-011).
 
-### Task 4 — Break and repair (optional but instructive)
+### Task 4: Break and repair (optional but instructive)
 
 Stop Postgres (`make db-down` for Docker; stop your native service). Try `make run` again. You should see the preflight fire and print a clear error. Start Postgres again. `make run` should succeed without any code change.
 
@@ -96,15 +96,15 @@ test_chat_session_roundtrip ..... OK
 
 ## Bonus challenges
 
-1. **Add a new health check** — modify `scripts/check_health.sh` to also verify Postgres is accepting connections (beyond what `make health` already does). Hint: `psql -c 'SELECT 1'` or `pg_isready`.
+1. **Add a new health check**: modify `scripts/check_health.sh` to also verify Postgres is accepting connections (beyond what `make health` already does). Hint: `psql -c 'SELECT 1'` or `pg_isready`.
 
-2. **Measure cold-start time** — wrap `make run` in a timer. How long from invocation to all three `/health` endpoints green? Where's the slowest phase?
+2. **Measure cold-start time**: wrap `make run` in a timer. How long from invocation to all three `/health` endpoints green? Where's the slowest phase?
 
-3. **Native-to-Docker swap** — switch your local dev from native Postgres to Docker Postgres (or vice versa) without losing your chat history. Hint: `pg_dump` / `pg_restore`.
+3. **Native-to-Docker swap**: switch your local dev from native Postgres to Docker Postgres (or vice versa) without losing your chat history. Hint: `pg_dump` / `pg_restore`.
 
-4. **Automate the `.env` template** — write a one-liner that generates a `.env` with `USE_MOCK=true` and a random-but-unused port for `DATABASE_URL` so you can run two baselines side by side.
+4. **Automate the `.env` template**: write a one-liner that generates a `.env` with `USE_MOCK=true` and a random-but-unused port for `DATABASE_URL` so you can run two baselines side by side.
 
-5. **Make `verify.py` parallel** — use `asyncio.gather()` to run the three tests concurrently. Does it actually get faster, or is the bottleneck somewhere else (Groq API latency, DB I/O)?
+5. **Make `verify.py` parallel**: use `asyncio.gather()` to run the three tests concurrently. Does it actually get faster, or is the bottleneck somewhere else (Groq API latency, DB I/O)?
 
 ## Where this leads
 

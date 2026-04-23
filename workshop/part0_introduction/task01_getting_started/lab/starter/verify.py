@@ -17,9 +17,6 @@ All three tests should print "OK" and the script should exit 0.
 from __future__ import annotations
 
 import sys
-from urllib.parse import urljoin
-
-import httpx
 
 BASE_URL = "http://localhost:8000"
 

@@ -18,8 +18,8 @@ from fastapi.testclient import TestClient
 def test_counter_increments_per_request() -> None:
     """After N requests through TestClient, counter.value should equal N."""
     # Import inside the test so the app-level lifespan has a clean slate.
-    from api_gateway.app.main import app
     from api_gateway.app.dependencies_counter import get_counter
+    from api_gateway.app.main import app
 
     # TestClient as context manager runs the lifespan — init_counter() runs here.
     with TestClient(app) as client:
@@ -27,12 +27,14 @@ def test_counter_increments_per_request() -> None:
         # Note: we read via the dependency function, the same path the route uses.
         assert get_counter().value == 0, "counter should start at 0"
 
-        N = 10
-        for _ in range(N):
+        n_requests = 10
+        for _ in range(n_requests):
             r = client.get("/health")
             assert r.status_code == 200
 
-        assert get_counter().value == N, f"expected counter == {N}, got {get_counter().value}"
+        assert get_counter().value == n_requests, (
+            f"expected counter == {n_requests}, got {get_counter().value}"
+        )
 
 
 def test_metrics_endpoint_returns_count() -> None:
@@ -53,8 +55,8 @@ def test_metrics_endpoint_returns_count() -> None:
 
 def test_dependency_override_isolates_counter() -> None:
     """Demonstrates dependency_overrides — the pattern Part I Task 4 expands on."""
-    from api_gateway.app.main import app
     from api_gateway.app.dependencies_counter import RequestCounter, get_counter
+    from api_gateway.app.main import app
 
     # A pre-populated fake counter. Route should see this, not the real one.
     fake = RequestCounter()
