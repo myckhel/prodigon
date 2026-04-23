@@ -12,6 +12,7 @@ Usage:
   → {"content": "# REST vs gRPC ...", "path": "part1_design_patterns/task01_rest_vs_grpc/README.md"}
 """
 
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Query
@@ -24,10 +25,24 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/workshop", tags=["workshop"])
 
-# Resolve workshop root: navigate from this file up to the repo root, then into workshop/
-# baseline/api_gateway/app/routes/workshop.py  →  parents[4]  →  repo root
-# parents[0]=routes, parents[1]=app, parents[2]=api_gateway, parents[3]=baseline, parents[4]=repo root
-_WORKSHOP_ROOT = (Path(__file__).resolve().parents[4] / "workshop").resolve()
+# Resolve the workshop root.
+#
+# Local dev: navigate 4 parents up from this file to reach the repo root, then
+#   descend into workshop/.
+#   baseline/api_gateway/app/routes/workshop.py
+#   parents[0]=routes  parents[1]=app  parents[2]=api_gateway
+#   parents[3]=baseline  parents[4]=repo root  → repo root/workshop
+#
+# Docker: the file lives at /app/api_gateway/app/routes/workshop.py so
+#   parents[4] would be /, not /app. Set WORKSHOP_ROOT=/app/workshop in the
+#   container (via docker-compose env + volume mount) to override this
+#   calculation.
+_ws_env = os.getenv("WORKSHOP_ROOT")
+_WORKSHOP_ROOT = (
+    Path(_ws_env).resolve()
+    if _ws_env
+    else (Path(__file__).resolve().parents[4] / "workshop").resolve()
+)
 
 
 class InvalidPathError(AppError):

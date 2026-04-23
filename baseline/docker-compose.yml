@@ -39,6 +39,14 @@ services:
       - MODEL_SERVICE_URL=http://model-service:8001
       - WORKER_SERVICE_URL=http://worker-service:8002
       - DATABASE_URL=postgresql+asyncpg://prodigon:prodigon@postgres:5432/prodigon
+      # Workshop content: the workshop/ directory lives at the repo root, one
+      # level above the baseline/ build context, so it can't be COPY'd into the
+      # image. We mount it read-only at runtime instead and point the route at
+      # the mount path via this env var (overrides the local-dev path calculation
+      # in workshop.py).
+      - WORKSHOP_ROOT=/app/workshop
+    volumes:
+      - ../workshop:/app/workshop:ro
     depends_on:
       model-service:
         condition: service_started
