@@ -1,4 +1,4 @@
-<!-- Version: v0 | Last updated: 2026-04-16 | Status: current -->
+<!-- Version: v1 | Last updated: 2026-04-23 | Status: current -->
 
 # Backend Architecture Deep Dive
 
@@ -13,10 +13,13 @@ This document provides a comprehensive reference for the Prodigon AI platform ba
 3. [Model Service (Port 8001)](#3-model-service-port-8001)
 4. [Worker Service (Port 8002)](#4-worker-service-port-8002)
 5. [Shared Module](#5-shared-module)
-6. [Dependency Injection Pattern](#6-dependency-injection-pattern)
-7. [Configuration Flow](#7-configuration-flow)
-8. [Error Hierarchy](#8-error-hierarchy)
-9. [Cross-References](#9-cross-references)
+6. [Alembic Migrations](#6-alembic-migrations)
+7. [Chat Repository](#7-chat-repository)
+8. [Workshop Content Route](#8-workshop-content-route)
+9. [Dependency Injection Pattern](#9-dependency-injection-pattern)
+10. [Configuration Flow](#10-configuration-flow)
+11. [Error Hierarchy](#11-error-hierarchy)
+12. [Cross-References](#12-cross-references)
 
 ---
 
@@ -64,8 +67,11 @@ async def lifespan(app: FastAPI):
     yield
     # 4. Cancel background tasks
     # 5. Close HTTP clients
+    # 6. await dispose_engine()  -- release the Postgres connection pool
     logger.info("service_stopped")
 ```
+
+Both the API Gateway (`baseline/api_gateway/app/main.py`) and the Worker Service (`baseline/worker_service/app/main.py`) end their `lifespan()` with `await dispose_engine()` from `shared.db`. That call invokes `engine.dispose()` on the process-wide async SQLAlchemy engine, returning every pooled connection to Postgres and clearing the module-level `_engine` / `_sessionmaker` globals so a restart rebuilds them cleanly.
 
 ---
 
@@ -202,8 +208,8 @@ The Worker Service manages background/batch inference jobs. It exposes a REST AP
 |---|---|---|---|
 | `service_name` | `str` | `"worker-service"` | Service identity |
 | `model_service_url` | `str` | `"http://localhost:8001"` | Model Service base URL (for job processing) |
-| `queue_type` | `str` | `"memory"` | Queue backend: `"memory"` or `"redis"` |
-| `redis_url` | `str` | `"redis://localhost:6379/0"` | Redis connection string (used when `queue_type="redis"`) |
+| `queue_type` | `str` | `"postgres"` | Queue backend: `"postgres"` (default, durable) or `"memory"` (in-process, test-only). `"redis"` is reserved for Task 8. |
+| `redis_url` | `str` | `"redis://localhost:6379/0"` | Redis connection string (unused until Task 8) |
 | `poll_interval` | `float` | `1.0` | Seconds between queue polls when idle |
 
 ### Key Classes
@@ -237,9 +243,37 @@ Internal data structures:
 
 `enqueue()` generates a UUID, creates a `JobResponse` with `PENDING` status, stores it, and appends the ID to `_pending`. `dequeue()` pops from the front of `_pending` and marks the job as `RUNNING`.
 
-#### `create_queue(queue_type)` Factory
+#### `PostgresQueue`
 
-Returns an `InMemoryQueue` for `queue_type="memory"`. Raises `NotImplementedError` for `"redis"` (placeholder for Task 8 -- Load Balancing and Caching). Raises `ValueError` for unknown types.
+**File:** `baseline/worker_service/app/services/queue.py`
+
+Durable, multi-worker-safe queue backed by the `batch_jobs` table. Used by default in both local dev and docker-compose (`QUEUE_TYPE=postgres`).
+
+- **`enqueue()`** inserts a `BatchJob` row with `status='pending'`, `prompts` as JSONB, `results=[]`, `total_prompts=len(prompts)`. Commit returns the refreshed row; converted to a `JobResponse` via `_job_to_response()`.
+- **`dequeue()`** runs:
+
+  ```python
+  select(BatchJob)
+      .where(BatchJob.status == JobStatus.PENDING.value)
+      .order_by(BatchJob.created_at.asc())
+      .limit(1)
+      .with_for_update(skip_locked=True)
+  ```
+
+  SQLAlchemy translates `with_for_update(skip_locked=True)` to `SELECT ... FOR UPDATE SKIP LOCKED`. The selected row is locked for the duration of the transaction; any concurrent worker running the same query skips past it. Inside the same transaction the row's `status` is flipped to `running` and the transaction commits — so once the lock releases, other workers see the new status and will not reconsider the row. No retries, no contention storms, no double-processing.
+- **`get_job()`** / **`update_job()`** are straightforward `session.get()` / `update()` statements. `update_job()` only allows patching a fixed set of columns (`status`, `results`, `completed_prompts`, `completed_at`, `error`) and normalises `JobStatus` enums to their string value for storage.
+
+#### `create_queue(queue_type, sessionmaker=None)` Factory
+
+| Arg value | Returns |
+|---|---|
+| `"postgres"` | `PostgresQueue(sessionmaker)` — requires a sessionmaker; raises `ValueError` if not passed. |
+| `"memory"` | `InMemoryQueue()` — dev/test fallback only. Jobs are lost on restart. |
+| `"redis"` | Raises `NotImplementedError` pointing at Task 8 (Load Balancing & Caching). |
+
+The worker's `init_dependencies()` in `baseline/worker_service/app/dependencies.py` threads `shared.db.get_sessionmaker()` into the factory when `queue_type == "postgres"`, so the queue shares the worker's single connection pool rather than building a second one.
+
+**Why Postgres and not Redis yet**: we already run Postgres for chat and users, so the queue adds no operational surface. Baseline throughput (human-driven batches, not millions of events/sec) is well within Postgres's capability envelope, and `SKIP LOCKED` is a well-documented competing-consumers pattern. Redis earns its keep when latency-sensitive paths show up in Task 8.
 
 #### `JobProcessor`
 
@@ -397,6 +431,38 @@ Configures structlog for consistent, machine-readable log output across all serv
 - `setup_logging(service_name, log_level)` -- Configures structlog and binds the service name to context vars. Called once at module level in each service's `main.py`.
 - `get_logger(name)` -- Returns a `BoundLogger` instance. Usage: `logger = get_logger(__name__)`.
 
+### `db.py` -- Async Database Engine
+
+**File:** `baseline/shared/db.py`
+
+Single source of SQLAlchemy state for every service that touches Postgres. Centralising here means the gateway and worker share one engine class, one `DeclarativeBase` (used by Alembic's autogenerate diff), and one session factory — no schema drift, no competing pool pools per service.
+
+| Symbol | Purpose |
+|---|---|
+| `Base(DeclarativeBase)` | Root ORM class. Every model in `shared/models.py` inherits from it. `Base.metadata` is what Alembic's autogenerate compares against the live DB. |
+| `_resolve_database_url()` | Reads `DATABASE_URL` env var, falls back to `postgresql+asyncpg://prodigon:prodigon@localhost:5432/prodigon`. |
+| `get_engine()` | Lazily constructs the shared `AsyncEngine` via `create_async_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10)`. Lazy (not module-level) so tests can override env vars before the first call. |
+| `get_sessionmaker()` | Returns the module-level `async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)`. `expire_on_commit=False` is required in async code — otherwise post-commit attribute access would trigger an implicit lazy load that needs `await`. |
+| `get_session()` | FastAPI dependency: `async with sm() as session: yield session`. Used in routes as `db: AsyncSession = Depends(get_session)`. |
+| `dispose_engine()` | Closes the connection pool and nulls the module globals. Called by both services' lifespan shutdown. |
+
+The `asyncpg` driver is mandatory — the URL scheme `postgresql+asyncpg://` selects the async dialect. `pool_pre_ping=True` validates each connection before handing it out, so a stale socket after a DB restart manifests as a retry, not an error.
+
+### `models.py` -- ORM Models
+
+**File:** `baseline/shared/models.py`
+
+Four ORM classes, all keyed by UUIDs (stable across environments, safe to expose to clients). All timestamps default to `server_default=func.now()` so the DB clock is the source of truth instead of any individual app process.
+
+| Model | Table | Notes |
+|---|---|---|
+| `User` | `users` | Minimal account row. `email` (unique, indexed), optional `display_name`. A default user (`00000000-0000-0000-0000-000000000001`) is seeded by the initial migration so chat/job endpoints can attribute ownership before real auth exists. `sessions` relationship cascades on delete. |
+| `ChatSession` | `chat_sessions` | `user_id` FK → `users` (CASCADE on user delete, indexed). `title` (max 200, defaults to "New Chat"), optional `system_prompt` (Text). `created_at` / `updated_at` both server-default `now()`; `updated_at` also has `onupdate=func.now()`. Relationship `messages` orders by `ChatMessage.created_at` and cascades on session delete. |
+| `ChatMessage` | `chat_messages` | `session_id` FK → `chat_sessions` **ON DELETE CASCADE** (indexed). `role` VARCHAR(20) — validated at the Pydantic layer to `{user, assistant, system}`. `content` Text. `meta` JSONB (opaque bag for `model`, `latency_ms`, etc.). `created_at` indexed for ordering. |
+| `BatchJob` | `batch_jobs` | Durable replacement for the in-memory job queue. `user_id` FK **ON DELETE SET NULL** (so a job's history outlives the user that submitted it). `status` VARCHAR(20) instead of Postgres ENUM — enums are painful to migrate, strings + the `JobStatus` enum in `schemas.py` are fine. `prompts` / `results` are JSONB (variable-length lists without a join table). `total_prompts`, `completed_prompts`, `max_tokens`, `model`, `error`, `completed_at` round out the shape. Indexed on `status`, `created_at`, `user_id`. |
+
+**Why these four and not more:** the baseline needs to prove end-to-end persistence. Usage stats, audit logs, rate-limit tokens and so on belong to later workshop tasks and would bloat the initial migration surface.
+
 ### `constants.py` -- Platform Constants
 
 | Constant | Value | Used By |
@@ -412,7 +478,103 @@ Configures structlog for consistent, machine-readable log output across all serv
 
 ---
 
-## 6. Dependency Injection Pattern
+## 6. Alembic Migrations
+
+**Config:** `baseline/alembic.ini` — `script_location = alembic`, `prepend_sys_path = .`, and a date-prefixed `file_template` (`%(year)d%(month).2d%(day).2d_%(hour).2d%(minute).2d_%(slug)s`) so `ls alembic/versions/` gives chronological order. The `sqlalchemy.url` in the ini is a fallback only — used when autogenerating revisions outside the app process.
+
+**Env:** `baseline/alembic/env.py` is **async-aware**. Our app engine is `postgresql+asyncpg`, which a synchronous Alembic connection can't drive. The env reads `DATABASE_URL` from the environment and overrides `config.set_main_option("sqlalchemy.url", env_url)`; then in online mode:
+
+```python
+connectable = create_async_engine(config.get_main_option("sqlalchemy.url"), poolclass=None)
+async with connectable.connect() as connection:
+    await connection.run_sync(do_run_migrations)
+await connectable.dispose()
+```
+
+`connection.run_sync(do_run_migrations)` is the standard bridge from the async connection into Alembic's synchronous context API. `do_run_migrations` calls `context.configure(connection=connection, target_metadata=Base.metadata, compare_type=True, compare_server_default=True)` and runs the pending revisions inside a transaction.
+
+`env.py` imports `shared.models` purely for its side-effect: each ORM class registers on `Base.metadata`, which is what `target_metadata` points at. Without that import, autogenerate would see an empty metadata and emit an empty diff.
+
+**Workflow:**
+
+| Make target | What it runs |
+|---|---|
+| `make db-migrate` | `cd baseline && alembic upgrade head` — idempotent; safe to run repeatedly. |
+| `make db-revision M="message"` | `cd baseline && alembic revision --autogenerate -m "message"` — diff current models against live DB and emit a new revision file. |
+
+In Docker, the gateway's entrypoint runs `alembic upgrade head` before uvicorn starts, so a fresh DB is always migrated on first boot without an operator step. `scripts/run_all.sh` (native path) does the same on every boot.
+
+---
+
+## 7. Chat Repository
+
+**File:** `baseline/api_gateway/app/services/chat_repository.py`
+
+Keeps SQL out of route handlers. Route handlers describe HTTP behaviour; the repository describes storage. Scoped by `user_id` — every read and write filters on `self.user_id`, so swapping the seeded default for a real `get_current_user` dependency is a one-line change.
+
+```python
+DEFAULT_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+class ChatRepository:
+    def __init__(self, session: AsyncSession, user_id: uuid.UUID = DEFAULT_USER_ID):
+        self.session = session
+        self.user_id = user_id
+```
+
+| Method | Behaviour |
+|---|---|
+| `create_session(payload)` | Inserts a `ChatSession` row with `user_id=self.user_id`, commits, returns `ChatSessionOut`. |
+| `list_sessions(limit=100)` | Left-joins a `count(messages)` subquery and returns `ChatSessionOut` rows ordered by `updated_at DESC`. One round-trip delivers session list + per-session message counts. |
+| `get_session_detail(session_id)` | Loads a session with `selectinload(ChatSession.messages)`, returns `ChatSessionDetail` or `None`. |
+| `update_session(session_id, payload)` | Patches `title` / `system_prompt` if present; returns updated `ChatSessionOut` or `None`. |
+| `delete_session(session_id)` | `DELETE FROM chat_sessions WHERE id = :id` — messages cascade. Returns `bool`. |
+| `append_message(session_id, payload)` | Inserts a `ChatMessage` and touches `session.updated_at = func.now()` in one transaction so list ordering reflects activity. Returns `ChatMessageOut` or `None`. |
+
+The router wires this up via a per-request factory:
+
+```python
+def _repo(db: AsyncSession = Depends(get_session)) -> ChatRepository:
+    return ChatRepository(db)
+```
+
+Each request gets a fresh `AsyncSession` (via `shared.db.get_session`) bound into a fresh `ChatRepository` — no cross-request state leakage, no connection reuse bugs.
+
+---
+
+## 8. Workshop Content Route
+
+**File:** `baseline/api_gateway/app/routes/workshop.py`
+
+Single endpoint: `GET /api/v1/workshop/content?path=<relative>`. Serves markdown files out of the repo's `workshop/` directory so the SPA can render topic pages without bundling all the content into the frontend build.
+
+**Resolution anchor:**
+
+```python
+_WORKSHOP_ROOT = (Path(__file__).resolve().parents[4] / "workshop").resolve()
+# parents: [0]=routes, [1]=app, [2]=api_gateway, [3]=baseline, [4]=repo root
+```
+
+`.resolve()` at the root means any symlink shenanigans happen once, up front, so every subsequent check works against real paths.
+
+**Security boundary** (all four checks are mandatory — removing any one opens an LFI):
+
+1. **Traversal rejection** — if the raw path contains `..` or starts with `/` or `\`, raise `InvalidPathError(400)`. Early reject keeps adversarial inputs from even touching the filesystem.
+2. **Extension filter** — only `.md` files are served. Rejects anything else with `400 INVALID_PATH`.
+3. **Resolve + containment check** — `resolved = (_WORKSHOP_ROOT / raw).resolve()`, then `resolved.relative_to(_WORKSHOP_ROOT)`. If the resolved path isn't actually under the root (which symlinks could still enable), `relative_to` raises `ValueError` and we return `400 INVALID_PATH`. A warning log (`workshop_path_traversal_attempt`) is emitted on this branch so a WAF or ops alert can catch probing.
+4. **Existence check** — `resolved.is_file()` or `404 NOT_FOUND`.
+
+**Errors** (inherit from `AppError`):
+
+| Class | status_code | error_code |
+|---|---|---|
+| `InvalidPathError` | 400 | `INVALID_PATH` |
+| `ContentNotFoundError` | 404 | `NOT_FOUND` |
+
+**Response:** `{"content": "<file text>", "path": "<raw relative path>"}`. No auth; intended purely for the frontend Content Viewer.
+
+---
+
+## 9. Dependency Injection Pattern
 
 All three services use the same DI approach: **module-level globals initialized during lifespan, accessed via getter functions used in `Depends()`**.
 
@@ -466,7 +628,7 @@ sequenceDiagram
 
 ---
 
-## 7. Configuration Flow
+## 10. Configuration Flow
 
 Configuration flows from a `.env` file through Pydantic Settings into service-specific classes, which are then injected into route handlers via the dependency system.
 
@@ -510,7 +672,7 @@ classDiagram
     class WorkerServiceSettings {
         +str service_name = "worker-service"
         +str model_service_url
-        +str queue_type = "memory"
+        +str queue_type = "postgres"
         +str redis_url
         +float poll_interval = 1.0
     }
@@ -537,7 +699,7 @@ Pydantic Settings automatically maps environment variables to fields by name (ca
 
 ---
 
-## 8. Error Hierarchy
+## 11. Error Hierarchy
 
 ```mermaid
 classDiagram
@@ -590,7 +752,7 @@ This guarantees that all error responses across all services share the same JSON
 
 ---
 
-## 9. Cross-References
+## 12. Cross-References
 
 - **[API Reference](api-reference.md)** -- Complete endpoint specifications with request/response examples.
 - **[Data Flow](data-flow.md)** -- End-to-end request traces for generation, streaming, and batch job flows.

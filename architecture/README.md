@@ -1,4 +1,4 @@
-<!-- Version: v0 | Last updated: 2026-04-16 | Status: current -->
+<!-- Version: v1 | Last updated: 2026-04-23 | Status: current -->
 
 # Prodigon Architecture Documentation
 
@@ -8,14 +8,14 @@ Comprehensive architecture documentation for the Prodigon AI platform — a mult
 
 | Document | Purpose | Version |
 |----------|---------|---------|
-| [System Overview](system-overview.md) | High-level architecture, tech stack, service inventory, repo structure | v0 |
-| [Backend Architecture](backend-architecture.md) | Services deep dive: Gateway, Model, Worker, Shared module, DI pattern | v0 |
-| [Frontend Architecture](frontend-architecture.md) | React SPA: components, stores, hooks, streaming, build pipeline | v0 |
-| [API Reference](api-reference.md) | Complete endpoint reference with schemas, examples, and error codes | v0 |
-| [Data Flow](data-flow.md) | User flows with sequence diagrams: streaming, jobs, health monitoring | v0 |
-| [Infrastructure](infrastructure.md) | Docker, Nginx, networking, deployment modes, environment config | v0 |
-| [Getting Started](getting-started.md) | Step-by-step setup guide with troubleshooting for all known issues | v0 |
-| [Design Decisions](design-decisions.md) | 8 Architecture Decision Records (ADRs) with rationale | v0 |
+| [System Overview](system-overview.md) | High-level architecture, tech stack, service inventory, repo structure | v1 |
+| [Backend Architecture](backend-architecture.md) | Services deep dive: Gateway, Model, Worker, Shared module, DI pattern | v1 |
+| [Frontend Architecture](frontend-architecture.md) | React SPA: components, stores, hooks, streaming, build pipeline | v1 |
+| [API Reference](api-reference.md) | Complete endpoint reference with schemas, examples, and error codes | v1 |
+| [Data Flow](data-flow.md) | User flows with sequence diagrams: streaming, jobs, health monitoring | v1 |
+| [Infrastructure](infrastructure.md) | Docker, Nginx, networking, deployment modes, environment config | v1 |
+| [Getting Started](getting-started.md) | Step-by-step setup guide with troubleshooting for all known issues | v1 |
+| [Design Decisions](design-decisions.md) | 8 Architecture Decision Records (ADRs) with rationale | v1 |
 
 ## Reading Order
 
@@ -40,7 +40,7 @@ Comprehensive architecture documentation for the Prodigon AI platform — a mult
 
 ## Versioning Policy
 
-These documents are **Version 0 (v0)** — the initial architecture as of 2026-04-16.
+These documents are **Version 1 (v1)** — adds Postgres persistence, durable worker queue, polished frontend v2 (Topics Panel, Command Palette, Toast, workshop content), 2026-04-23. v0 snapshot archived at `versions/v0/`.
 
 ### When to version
 
@@ -66,6 +66,7 @@ Do **not** version for:
 
 | Version | Date | Summary |
 |---------|------|---------|
+| v1 | 2026-04-23 | (1) Polished frontend v2: Topics Panel, Command Palette (Cmd+K), Toast notifications, workshop content API (/api/v1/workshop/content), /topics/* routes, onboarding banner, chat export, session stats, accessibility (skip-nav, focus trap, aria-current), Inter font, three-panel layout. (2) Postgres 16 persistence: chat sessions/messages/batch jobs, durable SKIP LOCKED queue, 6 /api/v1/chat/* endpoints, server-backed frontend chat store, native-Postgres dev workflow. v0 snapshot at versions/v0/. |
 | v0 | 2026-04-16 | Initial architecture documentation. Covers baseline services, React frontend, Docker infrastructure, and 8 ADRs. |
 
 ## Diagrams

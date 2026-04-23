@@ -1,4 +1,4 @@
-<!-- Version: v0 | Last updated: 2026-04-16 | Status: current -->
+<!-- Version: v1 | Last updated: 2026-04-23 | Status: current -->
 
 # Prodigon AI Platform -- API Reference
 
@@ -11,6 +11,8 @@ Complete endpoint reference for the Prodigon AI system. This document covers eve
 1. [Base URLs](#1-base-urls)
 2. [Health Check](#2-health-check)
 3. [Text Generation](#3-text-generation)
+   - [3.5 Chat API](#35-chat-api)
+   - [3.6 Workshop Content API](#36-workshop-content-api)
 4. [Streaming Text Generation (SSE)](#4-streaming-text-generation-sse)
 5. [Batch Job Submission](#5-batch-job-submission)
 6. [Job Status](#6-job-status)
@@ -127,6 +129,180 @@ Synchronous text generation. The API Gateway proxies this request to the Model S
 curl -X POST http://localhost:8000/api/v1/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Hello, who are you?", "max_tokens": 256}'
+```
+
+---
+
+## 3.5 Chat API
+
+Persistent chat sessions and messages, backed by Postgres. All endpoints live under the API Gateway at `/api/v1/chat` (`baseline/api_gateway/app/routes/chat.py`) and are scoped internally by `user_id` (seeded default user until Part III authentication).
+
+Pydantic schemas are defined once in `baseline/shared/schemas.py` — `ChatSessionCreate`, `ChatSessionUpdate`, `ChatSessionOut`, `ChatSessionDetail`, `ChatMessageCreate`, `ChatMessageOut`, `ChatMessageRole` (`"user"` / `"assistant"` / `"system"`). Timestamps are ISO 8601 UTC. The `meta` field on a message is an opaque JSONB bag used by the frontend for `model` and `latency_ms`.
+
+**Common errors:**
+
+| Condition | HTTP | Error code |
+|---|---|---|
+| Malformed session UUID in path (`_parse_uuid` failure) | 400 | `VALIDATION_ERROR` (detail: "Invalid session id") |
+| Session does not exist / not owned by caller | 404 | `JOB_NOT_FOUND`-style envelope (detail: "Session not found") |
+
+### `POST /api/v1/chat/sessions`
+
+Create a new session.
+
+**Request body** (`ChatSessionCreate`):
+
+```json
+{
+  "title": "My design review session",
+  "system_prompt": "You are a senior systems architect."
+}
+```
+
+Both fields are optional. If `title` is omitted or null, the server uses `"New Chat"`. `title` max length 200.
+
+**Response (201 Created)** — `ChatSessionOut`:
+
+```json
+{
+  "id": "b8e5f0c4-...",
+  "user_id": "00000000-0000-0000-0000-000000000001",
+  "title": "My design review session",
+  "system_prompt": "You are a senior systems architect.",
+  "created_at": "2026-04-23T14:30:00Z",
+  "updated_at": "2026-04-23T14:30:00Z",
+  "message_count": 0
+}
+```
+
+### `GET /api/v1/chat/sessions`
+
+List sessions for the current user. Returns summaries only — no messages — so the response stays small for users with many sessions. Ordered by `updated_at DESC`. Capped at 100 rows.
+
+**Response (200 OK):** `ChatSessionOut[]` (same shape as above, `message_count` populated from a `COUNT(*)` subquery).
+
+### `GET /api/v1/chat/sessions/{id}`
+
+Fetch a single session plus its messages, ordered chronologically.
+
+**Response (200 OK)** — `ChatSessionDetail`:
+
+```json
+{
+  "id": "b8e5f0c4-...",
+  "user_id": "00000000-0000-0000-0000-000000000001",
+  "title": "My design review session",
+  "system_prompt": "You are a senior systems architect.",
+  "created_at": "2026-04-23T14:30:00Z",
+  "updated_at": "2026-04-23T14:35:12Z",
+  "message_count": 2,
+  "messages": [
+    {
+      "id": "3a1f...",
+      "session_id": "b8e5f0c4-...",
+      "role": "user",
+      "content": "Design a rate limiter.",
+      "meta": null,
+      "created_at": "2026-04-23T14:30:04Z"
+    },
+    {
+      "id": "4b2a...",
+      "session_id": "b8e5f0c4-...",
+      "role": "assistant",
+      "content": "A token-bucket algorithm...",
+      "meta": {"model": "llama-3.3-70b-versatile", "latency_ms": 812.4},
+      "created_at": "2026-04-23T14:35:12Z"
+    }
+  ]
+}
+```
+
+**Errors:** `400` on malformed UUID; `404` when the session isn't found or isn't owned by the caller.
+
+### `PATCH /api/v1/chat/sessions/{id}`
+
+Update `title` and/or `system_prompt`. Fields left out of the body are unchanged.
+
+**Request body** (`ChatSessionUpdate`):
+
+```json
+{
+  "title": "Renamed session"
+}
+```
+
+**Response (200 OK):** `ChatSessionOut`.
+
+### `DELETE /api/v1/chat/sessions/{id}`
+
+Delete a session. `ON DELETE CASCADE` on the `chat_messages.session_id` foreign key drops every message in the same transaction.
+
+**Response:** `204 No Content`. No body.
+
+### `POST /api/v1/chat/sessions/{id}/messages`
+
+Append a message to a session. Used for both user and assistant turns — the frontend POSTs the user message eagerly and the assistant message on `onDone` of the streaming response.
+
+**Request body** (`ChatMessageCreate`):
+
+```json
+{
+  "role": "assistant",
+  "content": "Here's the outline...",
+  "meta": {"model": "llama-3.3-70b-versatile", "latency_ms": 812.4}
+}
+```
+
+`role` must be one of `user`, `assistant`, `system`; `content` must be non-empty; `meta` is optional.
+
+**Response (201 Created)** — `ChatMessageOut`. Same shape as entries in `ChatSessionDetail.messages`. The session's `updated_at` is bumped in the same transaction so the sidebar re-sorts.
+
+---
+
+## 3.6 Workshop Content API
+
+Read-only markdown reader for the frontend's topic pages. Source of truth: the repo's `workshop/` directory. Not intended for arbitrary static file hosting — the endpoint is deliberately scoped to `.md` files under one resolved root.
+
+### `GET /api/v1/workshop/content`
+
+**Query parameter:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | yes | Relative path under `workshop/`, e.g. `part1_design_patterns/task01_rest_vs_grpc/README.md`. |
+
+**Response (200 OK):**
+
+```json
+{
+  "content": "# REST vs gRPC\n\nThis task explores...",
+  "path": "part1_design_patterns/task01_rest_vs_grpc/README.md"
+}
+```
+
+`content` is the raw file text, UTF-8. `path` is echoed back verbatim from the request (useful for the client to confirm what was resolved).
+
+**Errors:**
+
+| Condition | HTTP | Error code |
+|---|---|---|
+| Path contains `..`, is absolute, or isn't `.md` | 400 | `INVALID_PATH` |
+| Path resolves outside `_WORKSHOP_ROOT` (caught via `Path.relative_to`) | 400 | `INVALID_PATH` |
+| File doesn't exist | 404 | `NOT_FOUND` |
+
+Error envelope follows the standard shape (see §8).
+
+**Notes:**
+
+- No authentication. This is intentionally a plain `GET` so the frontend's `ContentViewer` can fetch without credential bookkeeping.
+- Path traversal attempts are logged with the structlog event `workshop_path_traversal_attempt` for ops visibility.
+- The resolution anchor is `Path(__file__).resolve().parents[4] / "workshop"` (see `baseline/api_gateway/app/routes/workshop.py`), so the gateway must run from within the baseline/ tree for this to resolve correctly. Docker builds mount the `workshop/` directory into the gateway's build context.
+
+**Example:**
+
+```bash
+curl "http://localhost:8000/api/v1/workshop/content?path=part1_design_patterns/task01_rest_vs_grpc/README.md"
+curl "http://localhost:8000/api/v1/workshop/content?path=../../.env"   # → 400 INVALID_PATH
 ```
 
 ---
@@ -251,6 +427,8 @@ curl -X POST http://localhost:8000/api/v1/jobs \
   -d '{"prompts": ["What is Python?", "What is FastAPI?"]}'
 ```
 
+> **Persistence note:** Jobs persist in the Postgres `batch_jobs` table — they survive worker restarts and support horizontal scaling. The worker's background loop dequeues pending rows via `SELECT ... FOR UPDATE SKIP LOCKED`, so multiple worker processes can compete on the same table without double-processing. The in-memory queue is still available via `QUEUE_TYPE=memory` for tests and no-DB demos. See [Backend Architecture §4](backend-architecture.md#4-worker-service-port-8002) for the queue strategy.
+
 ---
 
 ## 6. Job Status
@@ -366,6 +544,8 @@ All error responses follow a consistent structure:
 | `INFERENCE_ERROR` | 502 | Groq API failure after fallback models exhausted |
 | `SERVICE_UNAVAILABLE` | 503 | Backend service unreachable or request timed out |
 | `JOB_NOT_FOUND` | 404 | Invalid or unknown job ID |
+| `INVALID_PATH` | 400 | Workshop content path contains `..`, is absolute, is non-`.md`, or resolves outside `_WORKSHOP_ROOT` |
+| `NOT_FOUND` | 404 | Workshop content file does not exist |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 
 > **Frontend note:** Always check for the `error` key in responses with non-2xx status codes. The `code` field is stable and safe to use in conditional logic; the `message` field is for display only and may change.

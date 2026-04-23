@@ -1,4 +1,4 @@
-<!-- Version: v0 | Last updated: 2026-04-16 | Status: current -->
+<!-- Version: v1 | Last updated: 2026-04-23 | Status: current -->
 
 # Prodigon AI Platform -- Data Flow & Request Lifecycles
 
@@ -124,6 +124,80 @@ The key difference from the streaming flow: no `ReadableStream` parsing, no incr
 
 ---
 
+## 2b. Chat Session Lifecycle (Server-Backed)
+
+Chat state lives in Postgres. The frontend store is a cache of server state: it hydrates on app mount, persists every mutation through the chat API, and survives refresh / tab close / browser switch.
+
+Streaming assistant turns need an id before the server has one, so the frontend uses a **client-side temp id** (`tmp-<nanoid>`) while tokens arrive, then swaps it for the server UUID once `persistAssistantMessage` returns. Failed streams are deliberately not persisted — partial markdown is worse UX than a missing turn.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ChatView
+    participant ChatStore as chat-store
+    participant API as chatApi
+    participant Gateway as API Gateway :8000
+    participant Repo as ChatRepository
+    participant DB as Postgres
+
+    Note over ChatStore: App mount -- hydrate()
+    ChatStore->>API: listSessions()
+    API->>Gateway: GET /api/v1/chat/sessions
+    Gateway->>Repo: list_sessions()
+    Repo->>DB: SELECT ... ORDER BY updated_at DESC
+    DB-->>Repo: rows + message counts
+    Repo-->>Gateway: ChatSessionOut[]
+    Gateway-->>API: JSON
+    API-->>ChatStore: mapSessionSummary(...)
+
+    Note over User,ChatView: User sends a prompt
+    User->>ChatView: handleSend(prompt)
+
+    ChatView->>ChatStore: persistUserMessage(sessionId, content)
+    Note right of ChatStore: Optimistic local add with tmp id
+    ChatStore->>API: appendMessage(sessionId, {role:'user', content})
+    API->>Gateway: POST /api/v1/chat/sessions/{id}/messages
+    Gateway->>Repo: append_message(session_id, payload)
+    Repo->>DB: INSERT chat_messages + UPDATE chat_sessions.updated_at
+    DB-->>Repo: ChatMessage row
+    Repo-->>Gateway: ChatMessageOut
+    Gateway-->>API: JSON (server UUID)
+    API-->>ChatStore: swap tmp id for server UUID
+
+    Note over ChatStore: Assistant placeholder + streaming loop
+    ChatStore->>ChatStore: addAssistantPlaceholder(tmp-id)
+    loop Per streamed token
+        ChatStore->>ChatStore: appendToMessage(tmp-id, token)
+    end
+
+    Note over ChatStore: onDone -- persist assistant
+    ChatStore->>API: appendMessage(sessionId, {role:'assistant', content, meta:{model,latency_ms}})
+    API->>Gateway: POST /api/v1/chat/sessions/{id}/messages
+    Gateway->>Repo: append_message(...)
+    Repo->>DB: INSERT chat_messages + UPDATE updated_at
+    DB-->>Repo: row
+    Repo-->>Gateway: ChatMessageOut
+    Gateway-->>API: JSON
+    API-->>ChatStore: reconcile tmp id -> server UUID
+
+    Note over ChatView,ChatStore: Sidebar session switch (lazy message load)
+    User->>ChatView: clicks another session
+    ChatView->>ChatStore: setActiveSession(id)
+    alt messages not yet loaded
+        ChatStore->>API: getSession(id)
+        API->>Gateway: GET /api/v1/chat/sessions/{id}
+        Gateway->>Repo: get_session_detail(id) -- selectinload(messages)
+        Repo->>DB: SELECT session + messages
+        DB-->>Repo: rows
+        Repo-->>Gateway: ChatSessionDetail
+        Gateway-->>ChatStore: messages populated
+    end
+```
+
+**Refresh semantics**: the assistant turn runs entirely against the client-side temp id until `onDone`. If the user refreshes the tab mid-stream, the temp id vanishes with the tab — the completed-so-far content was never sent to the server, so the reloaded view shows only the user message. This is a deliberate simplification; see the ADR in `design-decisions.md`.
+
+---
+
 ## 3. Batch Job Submission & Polling
 
 Batch processing lets users submit multiple prompts at once for background inference. This flow has three distinct phases: submission, background processing, and polling.
@@ -137,7 +211,8 @@ sequenceDiagram
     participant API as api.submitJob()
     participant Gateway as API Gateway :8000
     participant WorkerService as Worker Service :8002
-    participant Queue as In-Memory Queue
+    participant Queue as PostgresQueue
+    participant DB as Postgres batch_jobs
 
     User->>JobSubmitForm: Enters prompts (one per line)
     User->>JobSubmitForm: Clicks Submit
@@ -146,8 +221,10 @@ sequenceDiagram
     API->>Gateway: POST /api/v1/jobs
 
     Gateway->>WorkerService: ServiceClient.post("/jobs")<br/>JobSubmission payload
-    WorkerService->>Queue: Queue.enqueue(submission)
-    Note right of Queue: Generates job_id (UUID),<br/>sets status: pending,<br/>stores prompts list
+    WorkerService->>Queue: enqueue(submission)
+    Queue->>DB: INSERT INTO batch_jobs<br/>(id, status='pending', prompts=JSONB, ...)
+    DB-->>Queue: Committed row
+    Queue-->>WorkerService: JobResponse (status:'pending')
 
     WorkerService-->>Gateway: 202 Accepted<br/>JobResponse {job_id, status:'pending',<br/>total_prompts, completed_prompts:0}
     Gateway-->>API: 202 Accepted
@@ -157,41 +234,54 @@ sequenceDiagram
     Note right of JobSubmitForm: Job appears in jobs list<br/>with "Pending" badge
 ```
 
-### 3b. Background Processing
+### 3b. Background Processing (Postgres SKIP LOCKED)
 
 ```mermaid
 sequenceDiagram
     participant WorkerLoop as worker_loop (background)
-    participant Queue as In-Memory Queue
+    participant Queue as PostgresQueue
+    participant DB as Postgres batch_jobs
     participant Processor as Processor
     participant ModelService as Model Service :8001
     participant GroqAPI as Groq API
 
-    loop Continuous polling
-        WorkerLoop->>Queue: Queue.dequeue()
-        Note right of Queue: Returns None if empty,<br/>sleeps briefly, retries
+    loop poll_interval seconds
+        WorkerLoop->>Queue: dequeue()
+        Queue->>DB: SELECT * FROM batch_jobs<br/>WHERE status='pending'<br/>ORDER BY created_at ASC<br/>LIMIT 1<br/>FOR UPDATE SKIP LOCKED
+        alt No pending row
+            DB-->>Queue: empty
+            Queue-->>WorkerLoop: None
+            Note right of WorkerLoop: sleep(poll_interval)
+        else Row claimed (locked for this tx)
+            DB-->>Queue: BatchJob row (locked)
+            Queue->>DB: UPDATE batch_jobs SET status='running'<br/>COMMIT
+            Note right of DB: Lock releases; other workers<br/>see 'running' and skip this row
+            Queue-->>WorkerLoop: (job_id, submission)
+        end
     end
 
-    Queue-->>WorkerLoop: (job_id, submission)
-    WorkerLoop->>Queue: Queue.update_job(job_id, status:'running')
+    WorkerLoop->>Processor: process(job_id, submission)
 
-    WorkerLoop->>Processor: Processor.process(job_id, submission)
-
-    loop For each prompt in submission.prompts
-        Processor->>ModelService: ServiceClient.post("/inference")<br/>{prompt, model}
-        ModelService->>GroqAPI: GroqInferenceClient.generate()
-        GroqAPI-->>ModelService: Response text
+    loop For each prompt
+        Processor->>ModelService: ServiceClient.post("/inference")
+        ModelService->>GroqAPI: generate()
+        GroqAPI-->>ModelService: response text
         ModelService-->>Processor: InferenceResponse
 
-        Processor->>Queue: Queue.update_job(job_id,<br/>completed_prompts += 1,<br/>results.append(text))
-        Note right of Queue: Progress updates are<br/>visible to polling clients
+        Processor->>Queue: update_job(job_id,<br/>completed_prompts+=1,<br/>results=[...])
+        Queue->>DB: UPDATE batch_jobs<br/>SET completed_prompts=..., results=...<br/>WHERE id=:id
+        Note right of DB: In-place update per iteration<br/>so polling clients see progress
     end
 
-    Processor->>Queue: Queue.update_job(job_id,<br/>status:'completed', completed_at:now())
+    Processor->>Queue: update_job(job_id, status='completed', completed_at=now())
+    Queue->>DB: UPDATE batch_jobs SET status='completed', completed_at=...
 
-    Note over Processor,Queue: If any prompt fails:
-    Processor--xQueue: Queue.update_job(job_id,<br/>status:'failed', error:message)
+    Note over Processor,DB: On failure
+    Processor--xQueue: update_job(job_id, status='failed', error=msg)
+    Queue--xDB: UPDATE batch_jobs SET status='failed', error=...
 ```
+
+**Concurrency guarantee:** two workers running the same `SELECT ... FOR UPDATE SKIP LOCKED` query never see the same row. Worker A locks the oldest pending row; Worker B's query skips past the locked row and returns the next pending one (or `None`). No retries, no blocking, no contention storms. As soon as Worker A commits its `status='running'` update, Worker B's subsequent `WHERE status='pending'` filter excludes that row anyway — belt and braces.
 
 ### 3c. Frontend Polling
 
@@ -202,7 +292,8 @@ sequenceDiagram
     participant API as api.getJob()
     participant Gateway as API Gateway :8000
     participant WorkerService as Worker Service :8002
-    participant Queue as In-Memory Queue
+    participant Queue as PostgresQueue
+    participant DB as Postgres batch_jobs
     participant JobsStore as jobs-store
 
     JobsView->>useJobPoll: Start polling (interval: 2s)
@@ -211,7 +302,9 @@ sequenceDiagram
         useJobPoll->>API: api.getJob(GET /api/v1/jobs/{id})
         API->>Gateway: GET /api/v1/jobs/{id}
         Gateway->>WorkerService: ServiceClient.get("/jobs/{id}")
-        WorkerService->>Queue: Queue.get_job(job_id)
+        WorkerService->>Queue: get_job(job_id)
+        Queue->>DB: SELECT * FROM batch_jobs WHERE id=:id
+        DB-->>Queue: row
         Queue-->>WorkerService: JobResponse with current progress
         WorkerService-->>Gateway: JobResponse
         Gateway-->>API: JSON response
@@ -407,6 +500,65 @@ graph TD
 - **Structured error responses:** All errors reaching the client follow the same shape: `{error: {code: string, message: string}}`, making frontend error handling consistent.
 - **Retry affordance:** When the frontend displays an error in a `MessageBubble`, it includes a retry button. Clicking it re-sends the original prompt through the same flow.
 - **Streaming errors:** During a streaming response, if an error occurs mid-stream, the SSE connection drops. The `useStream` hook detects the broken stream, calls `onError`, and the partial response is preserved with an error indicator appended.
+
+---
+
+## 7. Workshop Content Fetch
+
+When the user navigates into a workshop topic, the SPA pulls the markdown on demand from the gateway rather than bundling every topic into the initial payload. Read history lives in localStorage (`prodigon-read-history`, keyed by subtopic id) so returning users see their progress immediately without a server round trip.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant TopicTree as TopicTree / TopicsPanel
+    participant Router as React Router
+    participant ContentPage as ContentPage
+    participant API as fetchWorkshopContent
+    participant Gateway as API Gateway :8000
+    participant Workshop as workshop.py route
+    participant FS as workshop/ files on disk
+    participant Viewer as ContentViewer
+    participant TopicsStore as topics-store
+
+    User->>TopicTree: Clicks a subtopic link
+    TopicTree->>Router: navigate('/topics/:taskId/:subtopicId')
+    Router->>ContentPage: mount
+    ContentPage->>API: fetchWorkshopContent(subtopic.filePath)
+    API->>Gateway: GET /api/v1/workshop/content?path=<relative>.md
+
+    Gateway->>Workshop: get_workshop_content(path)
+    Workshop->>Workshop: _validate_path(raw)<br/>reject '..', absolute, non-.md
+    Workshop->>Workshop: (_WORKSHOP_ROOT / raw).resolve()<br/>.relative_to(_WORKSHOP_ROOT)
+    Workshop->>FS: Path.read_text()
+    FS-->>Workshop: file bytes
+    Workshop-->>Gateway: {content, path}
+    Gateway-->>API: JSON
+    API-->>ContentPage: content string
+
+    ContentPage->>Viewer: render via MarkdownRenderer
+    Note right of Viewer: GFM tables, code blocks,<br/>mermaid diagrams
+
+    Note over Viewer: Scroll behaviour
+    User->>Viewer: scrolls to end
+    Viewer->>Viewer: IntersectionObserver fires on bottom sentinel
+    Viewer->>TopicsStore: markAsRead(subtopicId)
+    TopicsStore->>TopicsStore: readHistory[].push(...)
+    Note right of TopicsStore: Persisted to localStorage<br/>key: prodigon-read-history
+```
+
+**Security path**: traversal attempts (`path=../../.env`) return `400 INVALID_PATH` before any filesystem read. The resolved-path check (`Path.relative_to(_WORKSHOP_ROOT)`) catches symlink escapes too. See [Backend Architecture §8](backend-architecture.md#8-workshop-content-route).
+
+---
+
+## 8. Lifespan — Engine Disposal
+
+Both services end their `lifespan()` with `await dispose_engine()` from `shared.db`. The call walks the shared `AsyncEngine`'s pool and closes every connection cleanly, then nulls the module-level `_engine` / `_sessionmaker` globals. This matters for:
+
+- **`docker stop`**: connections hit `FIN` instead of RST, so Postgres's `pg_stat_activity` clears immediately instead of waiting for TCP timeout.
+- **Test runs**: `pytest` can re-import modules and rebuild engines between test files without leaking connections.
+- **Local dev reloads**: uvicorn's `--reload` tears down the app cleanly between code changes.
+
+The gateway's shutdown order is: HTTP client `close()` → worker client `close()` → `dispose_engine()`. The worker's order is: cancel `worker_task` → model client `close()` → `dispose_engine()`. In both cases the DB pool is the last async resource released, since any in-flight handler might still need it.
 
 ---
 

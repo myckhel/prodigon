@@ -1,4 +1,4 @@
-<!-- Version: v0 | Last updated: 2026-04-16 | Status: current -->
+<!-- Version: v1 | Last updated: 2026-04-23 | Status: current -->
 
 # Infrastructure & Deployment
 
@@ -15,7 +15,7 @@ Prodigon supports four deployment configurations depending on your development n
 | Local backend only | `source venv/Scripts/activate && make run` | 3 uvicorn processes | 8000, 8001, 8002 | Backend development |
 | Local frontend only | `cd frontend && npm run dev` | Vite dev server | 5173 (proxies to 8000) | Frontend development |
 | Local full stack | Both above in separate terminals | Backend + Vite | 8000-8002, 5173 | Full-stack development |
-| Docker Compose | `make run-docker` | All services + nginx + redis | 80, 3000, 8000-8002, 6379 | Integration testing, demos |
+| Docker Compose | `make run-docker` | All services + nginx + postgres + redis | 80, 3000, 8000-8002, 5432, 6379 | Integration testing, demos |
 
 **Choosing a mode:** During active development, use local mode for fast iteration (no container rebuild needed). Use Docker Compose when testing service-to-service communication, nginx routing, or preparing for demos.
 
@@ -122,10 +122,13 @@ graph TD
 
     api-gateway -->|depends_on| model-service
     api-gateway -->|depends_on| worker-service
+    api-gateway -->|service_healthy| postgres
+    worker-service -->|service_healthy| postgres
 
     worker-service -->|depends_on| model-service
 
     redis[(Redis :6379)]
+    postgres[(Postgres :5432)]
     frontend[Frontend :3000]
 
     subgraph ai-platform-net [Docker Bridge Network: ai-platform-net]
@@ -134,6 +137,7 @@ graph TD
         model-service[Model Service :8001]
         worker-service[Worker Service :8002]
         frontend
+        postgres
         redis
     end
 
@@ -142,6 +146,7 @@ graph TD
     style model-service fill:#50c878,color:#fff
     style worker-service fill:#f4a460,color:#fff
     style frontend fill:#ff6b6b,color:#fff
+    style postgres fill:#336791,color:#fff
     style redis fill:#dc143c,color:#fff
 ```
 
@@ -150,11 +155,12 @@ graph TD
 | # | Service | Port Mapping | Build / Image | Key Environment Variables | Depends On |
 |---|---------|-------------|---------------|--------------------------|------------|
 | 1 | **nginx** | 80:80 | `./infra/Dockerfile.nginx` | -- | api-gateway, frontend |
-| 2 | **api-gateway** | 8000:8000 | `./api_gateway/Dockerfile` | `MODEL_SERVICE_URL=http://model-service:8001`, `WORKER_SERVICE_URL=http://worker-service:8002` | model-service, worker-service |
+| 2 | **api-gateway** | 8000:8000 | `./api_gateway/Dockerfile` | `MODEL_SERVICE_URL=http://model-service:8001`, `WORKER_SERVICE_URL=http://worker-service:8002`, `DATABASE_URL=postgresql+asyncpg://prodigon:prodigon@postgres:5432/prodigon` | model-service, worker-service, **postgres (`service_healthy`)** |
 | 3 | **model-service** | 8001:8001 | `./model_service/Dockerfile` | `GROQ_API_KEY` (from .env) | -- |
-| 4 | **worker-service** | 8002:8002 | `./worker_service/Dockerfile` | `MODEL_SERVICE_URL=http://model-service:8001` | model-service |
+| 4 | **worker-service** | 8002:8002 | `./worker_service/Dockerfile` | `MODEL_SERVICE_URL=http://model-service:8001`, `DATABASE_URL=postgresql+asyncpg://prodigon:prodigon@postgres:5432/prodigon`, `QUEUE_TYPE=postgres` | model-service, **postgres (`service_healthy`)** |
 | 5 | **frontend** | 3000:3000 | `../frontend/Dockerfile` | -- | -- |
-| 6 | **redis** | 6379:6379 | `redis:7-alpine` | -- | -- |
+| 6 | **postgres** | 5432:5432 | `postgres:16-alpine` | `POSTGRES_USER=prodigon`, `POSTGRES_PASSWORD=prodigon`, `POSTGRES_DB=prodigon`. Healthcheck: `pg_isready -U prodigon -d prodigon` (interval 3s, retries 20). Data volume: `postgres-data` (named). | -- |
+| 7 | **redis** | 6379:6379 | `redis:7-alpine` | -- | -- |
 
 ### Networking
 
@@ -361,8 +367,9 @@ Files: `.env.example` (root) and `baseline/.env.example`
 | `TEMPERATURE` | `0.7` | Default sampling temperature (0.0 = deterministic, 1.0 = creative) |
 | `MODEL_SERVICE_URL` | `http://localhost:8001` | Docker override: `http://model-service:8001` |
 | `WORKER_SERVICE_URL` | `http://localhost:8002` | Docker override: `http://worker-service:8002` |
-| `QUEUE_TYPE` | `memory` | `"memory"` (in-process) or `"redis"` (distributed) |
-| `REDIS_URL` | `redis://localhost:6379/0` | Docker override: `redis://redis:6379/0` |
+| `DATABASE_URL` | `postgresql+asyncpg://prodigon:prodigon@localhost:5432/prodigon` | Async SQLAlchemy URL. Docker override: `...@postgres:5432/prodigon`. Used by the gateway (chat repo) and worker (Postgres queue). |
+| `QUEUE_TYPE` | `postgres` | `"postgres"` (default — durable `SELECT ... FOR UPDATE SKIP LOCKED` against `batch_jobs`) or `"memory"` (in-process fallback for tests/demos). `"redis"` is reserved for Task 8. |
+| `REDIS_URL` | `redis://localhost:6379/0` | Docker override: `redis://redis:6379/0`. Only consulted when `QUEUE_TYPE=redis` (Task 8); the `redis` service is stubbed for now. |
 | `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:8000,http://localhost:5173,http://localhost:80` | CORS allowed origins (comma-separated) |
 
 ### Docker vs Local URLs
@@ -391,6 +398,59 @@ This is handled transparently -- the same application code reads from environmen
 2. Set your Groq API key: edit `.env` and fill in `GROQ_API_KEY`
 3. (Optional) Adjust model settings, log level, or toggle mock mode
 4. For Docker: no additional changes needed; docker-compose overrides service URLs automatically
+
+---
+
+## 9. Migrations on Boot
+
+Alembic migrations are applied automatically in Docker mode — no manual operator step.
+
+| Service | Runs migrations? | How |
+|---------|------------------|-----|
+| **api-gateway** | **Yes, on every boot** | `baseline/api_gateway/Dockerfile` sets `CMD ["sh", "-c", "alembic upgrade head && uvicorn ..."]`. `upgrade head` is idempotent at head, so re-runs are no-ops. |
+| **worker-service** | No (on boot) | `baseline/worker_service/Dockerfile` copies `alembic/` and `alembic.ini` into the image so the migrations are available for ad-hoc ops (e.g. `docker-compose run worker-service alembic upgrade head`), but the default CMD goes straight to uvicorn. The worker relies on `api-gateway` running migrations first; compose's `depends_on.postgres.service_healthy` guarantees the DB is reachable, and in practice the gateway and worker both race `service_healthy` but only one actually applies the (idempotent) migration. |
+
+For local (non-Docker) development, `scripts/run_all.sh` runs `alembic upgrade head` every time before launching uvicorn, so the native workflow matches the Docker behaviour.
+
+---
+
+## 10. Workshop Content Volume
+
+The gateway exposes `GET /api/v1/workshop/content?path=<relative>.md`, which reads files from the repo's `workshop/` directory at request time (see `baseline/api_gateway/app/routes/workshop.py`).
+
+### Path resolution
+
+`workshop.py` reads the `WORKSHOP_ROOT` environment variable first. When set, that path is used directly. When absent, it falls back to a computed path: `Path(__file__).resolve().parents[4] / "workshop"` — four hops up from the route file, which lands at the repo root in local dev.
+
+| Environment | How `workshop/` is reachable |
+|-------------|------------------------------|
+| **Local dev** | `WORKSHOP_ROOT` is not set; `parents[4]` resolves to the repo root and `workshop/` sits right there. Zero configuration needed. |
+| **Docker (Compose)** | `workshop/` lives at the repo root — one level above the `baseline/` build context — so it cannot be `COPY`'d into the image. Instead, `docker-compose.yml` mounts it read-only at `/app/workshop` and sets `WORKSHOP_ROOT=/app/workshop`, which the route picks up at startup. Workshop content is therefore always up to date without a container rebuild. |
+
+### docker-compose.yml wiring
+
+```yaml
+api-gateway:
+  environment:
+    - WORKSHOP_ROOT=/app/workshop
+  volumes:
+    - ../workshop:/app/workshop:ro
+```
+
+The volume is read-only (`:ro`). Workshop markdown is never written by the container — only read.
+
+The bundled SPA never ships workshop markdown — the content viewer fetches it on demand, so updates to `workshop/*.md` do not require a frontend rebuild or container restart (the bind-mount reflects host changes immediately).
+
+---
+
+## 11. External Third-Party Content
+
+The frontend pulls the **Inter** font from the Google Fonts CDN at runtime:
+
+- `fonts.googleapis.com` — CSS
+- `fonts.gstatic.com` — woff2 payloads
+
+`frontend/index.html` loads the stylesheet; `frontend/src/index.css` sets `body { font-family: 'Inter', system-ui, sans-serif }`. Users behind strict egress filters (offline demos, air-gapped networks, corporate DLP) will see the `system-ui` / `sans-serif` fallback — visually degraded but fully functional. No vendoring is currently performed; if a deployment requires the font locally, self-host by copying woff2 files into `frontend/public/fonts/` and switching `@font-face` to a local `src:`.
 
 ---
 
