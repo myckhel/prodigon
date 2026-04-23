@@ -2,7 +2,7 @@
 // MarkdownRenderer — full GFM markdown with syntax highlighting + Mermaid diagrams
 // ---------------------------------------------------------------------------
 
-import { useState, useEffect, useRef, useId } from 'react';
+import { useState, useEffect, useRef, useId, useDeferredValue } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -14,6 +14,9 @@ import { cn } from '@/lib/utils';
 
 interface MarkdownRendererProps {
   content: string;
+  /** Pass true while the assistant is still streaming tokens — suppresses Mermaid
+   *  rendering (partial syntax would throw) and defers heavy re-parses. */
+  streaming?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +81,15 @@ function PlainBlock({ children }: { children: string }) {
 // ---------------------------------------------------------------------------
 // MermaidBlock — lazy-loads mermaid and renders diagrams client-side
 // ---------------------------------------------------------------------------
-function MermaidBlock({ code }: { code: string }) {
+function MermaidBlock({ code, streaming }: { code: string; streaming?: boolean }) {
+  // While the parent message is still streaming, the mermaid syntax is likely
+  // incomplete — calling mermaid.render() on partial code throws a parse error
+  // on every token. Show the raw code as a plain block instead; once streaming
+  // finishes (streaming=false/undefined) the component re-mounts and renders.
+  if (streaming) {
+    return <PlainBlock>{code}</PlainBlock>;
+  }
+
   const uid = useId().replace(/:/g, '');
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);

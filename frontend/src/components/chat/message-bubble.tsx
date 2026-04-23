@@ -38,7 +38,10 @@ export function MessageBubble({ message, onRetry }: MessageBubbleProps) {
               <TypingIndicator />
             ) : (
               <div className="prose prose-sm dark:prose-invert max-w-none">
-                <MarkdownRenderer content={message.content} />
+                <MarkdownRenderer
+                  content={message.content}
+                  streaming={message.isStreaming ?? false}
+                />
               </div>
             )}
 
