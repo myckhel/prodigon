@@ -49,10 +49,6 @@ class ServiceClient:
             raise RuntimeError("ServiceClient not started. Call start() first.")
         return self._client
 
-    # REFACTOR TARGET: post() and get() share identical error-handling logic
-    # (ConnectError, HTTPStatusError, TimeoutException). The only difference is
-    # that post() logs the response body on HTTPStatusError. Extract a shared
-    # _request() helper and call it from both methods.
     async def post(self, path: str, json: dict, headers: dict | None = None) -> dict:
         """Send a POST request and return the JSON response."""
         try:
