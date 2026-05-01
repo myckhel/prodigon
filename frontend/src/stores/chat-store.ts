@@ -57,6 +57,10 @@ export interface ChatSession {
 interface ChatState {
   sessions: ChatSession[];
   activeSessionId: string | null;
+  // REFACTOR TARGET: boolean state uses three different naming conventions across
+  // this codebase — past tense (hydrated, messagesLoaded), present progressive
+  // (hydrating), and is-prefixed present progressive (isStreaming). Pick one
+  // style and apply it consistently, then document the convention here.
   hydrated: boolean;
   hydrating: boolean;
 
