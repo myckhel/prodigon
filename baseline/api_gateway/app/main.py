@@ -75,6 +75,10 @@ app.include_router(workshop.router)
 app.include_router(chat.router)
 
 
+# REFACTOR TARGET: this handler logs 3 fields (error_code, message, path) but
+# model_service/app/main.py logs 4 fields (adds status_code). worker_service has
+# the same 3-field version as here. Standardise all three to log status_code so
+# log queries for HTTP errors are consistent across services.
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
     logger.error("app_error", error_code=exc.error_code, message=exc.message, path=request.url.path)
